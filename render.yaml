@@ -1,0 +1,21 @@
+# Render Blueprint for the Portfolio Lab Market Data API (free web service).
+# The free instance sleeps after 15 idle minutes by design; Portfolio Lab wakes
+# it on page load and shows a "Waking market-data service…" stage. No keep-warm.
+services:
+  - type: web
+    name: portfolio-lab-market-data
+    runtime: python
+    plan: free
+    region: ohio
+    branch: main
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT --proxy-headers --no-server-header
+    healthCheckPath: /healthz
+    autoDeploy: true
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12.8"
+      - key: PORTFOLIO_LAB_SERVICE_KEY
+        sync: false
+      - key: MARKET_DATA_PREWARM
+        value: "1"

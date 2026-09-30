@@ -1,0 +1,5 @@
+# Pinned: the adjusted-close convention was qualified on yfinance 1.7.0.
+fastapi==0.142.2
+uvicorn[standard]==0.54.0
+yfinance==1.7.0
+pandas==3.0.6
