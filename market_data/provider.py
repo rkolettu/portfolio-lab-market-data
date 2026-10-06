@@ -19,6 +19,9 @@ Adjustment convention (qualified 2026-09-30 against Yahoo's chart API directly):
   MONTHLY bars even for `interval=1d` (verified: 405 bars vs 8,474 daily).
 * Rows with a missing adjusted close are dropped, never filled. No forward fill,
   interpolation or bridging anywhere.
+* OTC securities: Yahoo repeats the last price on sessions with no trades. Those
+  sessions are reported (`untraded`) so a mostly-stale history can be refused for
+  the requested window instead of passing as a near-riskless series.
 
 Yahoo's adjclose is float32-rounded and its adjustment factor is recomputed per
 request: identical requests differ by up to ~1e-6 relative. That is an upstream
@@ -44,6 +47,9 @@ ADJUSTMENT = {
     "fill": "none",
 }
 US_EXCHANGES = {"PCX", "NMS", "NGM", "NCM", "NYQ", "ASE", "BTS", "BATS"}
+# OTC Markets tiers as Yahoo names them: OTCQX, OTCQB, Pink and OTC ID. Large
+# foreign issuers (Nestlé, Roche, Tencent) trade in the U.S. only here.
+OTC_EXCHANGES = {"OQX", "OQB", "PNK", "OID"}
 EARLIEST = dt.date(1900, 1, 1)
 
 # Per-call `raise_errors=True` is deprecated in favour of a process-wide switch;
@@ -112,9 +118,10 @@ def _meta(ticker: str, meta: dict) -> dict:
     if symbol != ticker:
         raise MarketDataError("MALFORMED_DATA", f"Provider returned {symbol or 'no symbol'} for {ticker}.", "malformed")
     if (out["currency"] != "USD" or out["timezone"] != "America/New_York"
-            or out["instrument"] not in {"EQUITY", "ETF"} or out["exchange"] not in US_EXCHANGES):
+            or out["instrument"] not in {"EQUITY", "ETF"}
+            or out["exchange"] not in US_EXCHANGES | OTC_EXCHANGES):
         raise MarketDataError("UNSUPPORTED_ASSET",
-                              f"{ticker} is outside the supported USD U.S.-listed equity/ETF universe.",
+                              f"{ticker} is outside the supported USD U.S.-traded equity/ETF universe.",
                               "unsupported")
     return out
 
@@ -139,18 +146,23 @@ class YFinanceProvider:
 
     def history(self, ticker: str, start: dt.date | None, end_exclusive: dt.date) -> dict:
         """Daily adjusted closes from `start` (or the full history) up to, not including,
-        `end_exclusive`. Returns {"meta": ..., "rows": [(iso_date, adj_close), ...]}."""
+        `end_exclusive`. Returns {"meta": ..., "rows": [(iso_date, adj_close), ...],
+        "untraded": [iso_date, ...]}, the last listing the OTC sessions with zero
+        volume (always empty for exchange-listed securities)."""
         try:
             frame, meta = self._history(ticker, start or EARLIEST, end_exclusive)
         except Exception as exc:  # noqa: BLE001 - classified below
             raise classify(exc, ticker) from exc
         info = _meta(ticker, meta)
         if frame is None or frame.empty:
-            return {"meta": info, "rows": []}
+            return {"meta": info, "rows": [], "untraded": []}
         if "Adj Close" not in frame.columns:
             raise MarketDataError("MALFORMED_DATA", "Adjusted history is missing; raw close cannot replace it.",
                                   "malformed")
         rows: dict[str, float] = {}
+        untraded: set[str] = set()
+        otc = info["exchange"] in OTC_EXCHANGES and "Volume" in frame.columns
+        volumes = frame["Volume"] if otc else None
         for stamp, value in frame["Adj Close"].items():
             if value is None or (isinstance(value, float) and math.isnan(value)):
                 continue  # missing adjusted close: dropped, never filled
@@ -161,7 +173,9 @@ class YFinanceProvider:
             if day in rows and rows[day] != price:
                 raise MarketDataError("MALFORMED_DATA", f"Conflicting duplicate prices for {ticker}.", "malformed")
             rows[day] = price
-        return {"meta": info, "rows": sorted(rows.items())}
+            if otc and volumes[stamp] == 0:
+                untraded.add(day)
+        return {"meta": info, "rows": sorted(rows.items()), "untraded": sorted(untraded)}
 
     def quote(self, ticker: str, today: dt.date) -> dict:
         """Latest regular-market price and the recent raw (unadjusted) daily closes."""

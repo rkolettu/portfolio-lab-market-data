@@ -24,6 +24,11 @@ OVERLAP_DAYS = 14
 TOLERANCE = 5e-6
 QUOTE_TTL = 60.0
 NEGATIVE_TTL = 3600.0
+# An OTC history is refused for a window when more than this share of its
+# sessions (and more than STALE_MIN_SESSIONS) had no trades: Yahoo repeats the
+# last price on those days, which would understate volatility and correlation.
+STALE_SHARE = 0.10
+STALE_MIN_SESSIONS = 5
 COMMON = ["SPY", "QQQ", "IWM", "BND", "GLD"]
 
 
@@ -81,7 +86,9 @@ class MarketDataService:
         dates, closes = cache_mod.build(rows)
         now = self.wall()
         stats["full"] = stats.get("full", 0) + 1
-        return cache_mod.Entry(raw["meta"], dates, closes, _utc(now), _utc(now), self.mono(), target)
+        untraded = cache_mod.ordinals(d for d in raw.get("untraded", ()) if d <= target.isoformat())
+        return cache_mod.Entry(raw["meta"], dates, closes, _utc(now), _utc(now), self.mono(), target,
+                               untraded=untraded)
 
     def _incremental(self, ticker: str, entry: cache_mod.Entry, target: dt.date,
                      stats: dict) -> cache_mod.Entry:
@@ -105,9 +112,10 @@ class MarketDataService:
             if day > last.isoformat():  # cached values win for overlapping sessions
                 dates.append(dt.date.fromisoformat(day).toordinal())
                 closes.append(price)
+        added = cache_mod.ordinals(d for d in raw.get("untraded", ()) if last.isoformat() < d <= target.isoformat())
         stats["incremental"] = stats.get("incremental", 0) + 1
         return cache_mod.Entry(raw["meta"], dates, closes, entry.fetched_at, _utc(self.wall()),
-                               self.mono(), target)
+                               self.mono(), target, untraded=entry.untraded | added)
 
     def _ensure(self, ticker: str, target: dt.date, stats: dict) -> tuple[cache_mod.Entry, str | None]:
         """Entry complete through `target`, or the cached entry marked stale when the
@@ -158,6 +166,16 @@ class MarketDataService:
                                   f"{ticker} has no history in the requested range; it may have listed later.",
                                   "no_history")
         meta = entry.meta
+        if entry.untraded:
+            lo, hi = dt.date.fromisoformat(dates[0]).toordinal(), dt.date.fromisoformat(dates[-1]).toordinal()
+            untraded = sum(1 for o in entry.untraded if lo <= o <= hi)
+            if untraded > max(STALE_MIN_SESSIONS, STALE_SHARE * len(dates)):
+                # Per window, so never negatively cached: a recent window may be fine.
+                raise MarketDataError(
+                    "UNSUPPORTED_ASSET",
+                    f"{ticker} trades over the counter too thinly for daily analysis: {untraded} of "
+                    f"{len(dates)} sessions in this period had no trades, so its prices are stale.",
+                    "unsupported")
         return {
             "ok": True, "ticker": ticker, "currency": meta["currency"], "exchange": meta["exchange"],
             "instrument": meta["instrument"], "firstTradeDate": meta.get("firstTradeDate"),

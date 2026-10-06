@@ -66,6 +66,15 @@ series Portfolio Lab's direct research adapter reads.
   bars even for `interval=1d` (verified: 405 bars instead of 8,474 daily).
 - Missing adjusted closes are dropped, never filled: no forward fill,
   interpolation or bridging.
+- Universe: USD equities and ETFs on NYSE, Nasdaq, NYSE American, NYSE Arca and
+  Cboe, plus the OTC Markets tiers (OTCQX, OTCQB, Pink, OTC ID), where large
+  foreign issuers such as Nestlé (`NSRGY`) and Roche (`RHHBY`) trade in the U.S.
+- Stale OTC prices: Yahoo repeats the last price on sessions with no trades. For
+  OTC securities those zero-volume sessions are recorded with the cached history,
+  and a request is refused with `UNSUPPORTED_ASSET` when more than 10% of the
+  sessions in its window (and more than 5) had no trades. The check is per
+  window and never negatively cached, so a security that trades well now still
+  serves recent periods.
 - Only final sessions are cached or served: a weekday's bar counts once it is past
   16:20 New York time.
 - Yahoo re-derives `adjclose` per request in float32, so identical requests

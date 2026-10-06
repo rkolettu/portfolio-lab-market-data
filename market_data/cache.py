@@ -25,6 +25,7 @@ class Entry:
     refreshed_mono: float  # monotonic clock at refreshed_at
     checked_through: dt.date  # final session this entry is known complete through
     stats: dict = field(default_factory=dict)
+    untraded: frozenset = frozenset()  # date ordinals of OTC sessions with no trades
 
     @property
     def rows(self) -> int:
@@ -39,6 +40,10 @@ class Entry:
         hi = bisect.bisect_right(self.dates, end.toordinal())
         return ([dt.date.fromordinal(o).isoformat() for o in self.dates[lo:hi]],
                 list(self.closes[lo:hi]))
+
+
+def ordinals(days) -> frozenset:
+    return frozenset(dt.date.fromisoformat(d).toordinal() for d in days)
 
 
 def build(rows: list[tuple[str, float]]) -> tuple[array, array]:
