@@ -45,6 +45,7 @@ class FakeProvider:
 
     def __init__(self):
         self.series, self.meta, self.fail, self.calls = {}, {}, {}, []
+        self.untraded = {}  # ticker -> iso dates with zero volume (OTC)
         self.delay, self.active, self.peak = 0.0, 0, 0
         self.lock = threading.Lock()
 
@@ -79,7 +80,9 @@ class FakeProvider:
             self._maybe_fail(ticker)
             rows = [(d, p) for d, p in self.series[ticker]
                     if (start is None or d >= start.isoformat()) and d < end_exclusive.isoformat()]
-            return {"meta": self.meta[ticker], "rows": rows}
+            days = {d for d, _ in rows}
+            return {"meta": self.meta[ticker], "rows": rows,
+                    "untraded": sorted(d for d in self.untraded.get(ticker, ()) if d in days)}
         finally:
             self._leave()
 
@@ -194,6 +197,44 @@ def test_dividend_rebasing_triggers_a_full_refetch(world):
     assert stats["corrections"] == 1 and stats["full"] == 1
     assert fake.history_calls("SPY")[-1][2] is None  # full history again
     assert out["adjustedClose"][0] == pytest.approx(dict(fake.series["SPY"])["2026-09-14"])
+
+
+def test_otc_window_with_mostly_stale_prices_is_refused_but_a_liquid_window_is_served(world):
+    fake, clock, svc = world
+    rows = series(dt.date(2024, 1, 1), FRI)
+    fake.add("THINY", rows, exchange="PNK", instrument="EQUITY")
+    # No trades on every session of 2024; regular trading since.
+    fake.untraded["THINY"] = {d for d, _ in rows if d < "2025-01-01"}
+    with pytest.raises(MarketDataError) as e:
+        svc.history("THINY", dt.date(2024, 1, 2), dt.date(2025, 6, 30), {})
+    assert e.value.code == "UNSUPPORTED_ASSET" and "too thinly" in e.value.message
+    recent = svc.history("THINY", dt.date(2025, 6, 2), FRI, {})  # same cached entry, liquid window
+    assert recent["ok"] and recent["exchange"] == "PNK"
+    # The refusal was not negatively cached: the later window extended the entry.
+    assert [c[2] is None for c in fake.history_calls("THINY")] == [True, False]
+
+
+def test_a_few_untraded_otc_sessions_are_tolerated(world):
+    fake, clock, svc = world
+    rows = series(dt.date(2026, 1, 1), FRI)
+    fake.add("NSRGY", rows, exchange="OID", instrument="EQUITY")
+    fake.untraded["NSRGY"] = {rows[3][0], rows[40][0], rows[90][0]}
+    assert svc.history("NSRGY", dt.date(2026, 1, 2), FRI, {})["ok"]
+
+
+def test_incremental_refresh_keeps_untraded_sessions(world):
+    fake, clock, svc = world
+    rows = series(dt.date(2026, 8, 3), FRI)
+    fake.add("THINY", rows, exchange="PNK", instrument="EQUITY")
+    fake.untraded["THINY"] = {d for d, _ in rows[:-2]}
+    with pytest.raises(MarketDataError):
+        svc.history("THINY", dt.date(2026, 8, 3), FRI, {})
+    fake.series["THINY"].append((MON.isoformat(), 300.0))
+    clock.at(MON, 17)
+    stats = {}
+    with pytest.raises(MarketDataError):
+        svc.history("THINY", dt.date(2026, 8, 3), MON, stats)
+    assert stats["incremental"] == 1
 
 
 def test_single_flight_coalesces_concurrent_requests(world):
@@ -361,6 +402,32 @@ def test_provider_uses_adjclose_explicitly_and_never_fills(monkeypatch):
     assert calls["auto_adjust"] is False and calls["back_adjust"] is False and calls["repair"] is False
     assert calls["interval"] == "1d" and calls["start"] == "1900-01-01" and "period" not in calls
     assert calls["raise_errors"] is True and calls["keepna"] is False
+
+
+def test_provider_accepts_otc_venues_and_flags_untraded_sessions(monkeypatch):
+    for venue in ["OQX", "OQB", "PNK", "OID"]:
+        class T:
+            def __init__(self, ticker, venue=venue):
+                self.history_metadata = yf_meta(ticker, exchangeName=venue, instrumentType="EQUITY")
+
+            def history(self, **kw):
+                return frame([("2026-09-22", 100.0), ("2026-09-23", 100.0), ("2026-09-24", np.nan)],
+                             Volume=[1200, 0, 0])
+        monkeypatch.setattr(provider_mod.yf, "Ticker", T)
+        out = provider_mod.YFinanceProvider().history("NSRGY", None, dt.date(2026, 9, 26))
+        assert out["meta"]["exchange"] == venue
+        assert out["untraded"] == ["2026-09-23"]  # the dropped row is not counted
+
+
+def test_provider_never_flags_exchange_listed_volume(monkeypatch):
+    class T:
+        def __init__(self, ticker):
+            self.history_metadata = yf_meta(ticker)
+
+        def history(self, **kw):
+            return frame([("2026-09-22", 100.0)], Volume=[0])
+    monkeypatch.setattr(provider_mod.yf, "Ticker", T)
+    assert provider_mod.YFinanceProvider().history("SPY", None, dt.date(2026, 9, 26))["untraded"] == []
 
 
 def test_provider_rejects_non_us_assets_and_symbol_mismatch(monkeypatch):
